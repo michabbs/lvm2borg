@@ -1,0 +1,199 @@
+#!/bin/bash
+# lvm2borg 0.1
+# Copyright (c) 2023, Przemyslaw Kwiatkowski
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice, this
+#    list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+#    this list of conditions and the following disclaimer in the documentation
+#    and/or other materials provided with the distribution.
+#
+# 3. Neither the name of the copyright holder nor the names of its
+#    contributors may be used to endorse or promote products derived from
+#    this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+
+## CONFIGURATION
+
+# Define Borg repository here or provide in envinroinment.
+# Remember to export variables!
+#export BORG_REPO='ssh://my-remote-server/repo'
+#export BORG_PASSPHRASE=
+
+# You might want to add extra options to borg (see borg documentation)
+BORG_OPTS="--compression=auto,zstd"
+
+# You might want to run borg prune after successfull beckup. (Disabled if undefined.)
+PRUNE_OPTS="--keep-last=2 --keep-hourly=24 --keep-daily=14 --keep-weekly=8 --keep-monthly=15 --keep-yearly=10"
+
+# Maually set an archive name.
+#ARCHIVE_NAME="hostname-lv"
+
+# Use static snapshot name. (Not recommended!)
+#SNAPSHOT_NAME="mysnapshot"
+
+# The snapshot must be large enough to accommodate all the changes made to the lv during the lifespan of the snapshot.
+# As the backup process needs the snaposhot only for a very limited time - generally this number might be low.
+# Default setting of "10%ORIGIN" is most likely way to high. Decrease it if you have not enough free extents in vg.
+#SNAPSHOT_SIZE=10%ORIGIN
+
+# Use another than default borg binary.
+#BORG_BIN="echo borg"
+
+#
+# Do not edit beyond this point. :-)
+
+
+function help {
+cat >&2 <<EOF
+
+USAGE:  lvm2borg [--progress] my_vg/lv_name [fstype]
+
+    --progress  show progress when backing up data and summary afterwards
+    fstype      filesystem type to mount (determined automatically if ommitted)
+EOF
+exit 255
+}
+
+function discover_names() {
+    set $(lvs --noheadings -o lv_name,vg_name "$1" 2>/dev/null) >/dev/null
+    LV=$1
+    VG=$2
+}
+
+function create_tmpdir() {
+    TMP_DIR=$(mktemp -d -t lvm2borg-XXXXXXXXXX)
+    if [ ! -d "$TMP_DIR" ]; then
+        echo "Error: unable to create tmpdir." >&2
+        return 1
+    fi
+}
+
+function create_snapshot() {
+    if ( lvcreate "-l$SNAPSHOT_SIZE" -s -n "$SNAPSHOT_NAME" "$VG/$LV" 2>/dev/null); then
+        return 0
+    else
+        echo "Failed to create snapshot." >&2
+        return 1
+    fi
+}
+
+function destroy_snapshot() {
+    if ( lvremove -y "$VG/$SNAPSHOT_NAME" 2>/dev/null); then
+        return 0
+    else
+        echo "Failed to destroy snapshot." >&2
+        return 1
+    fi
+}
+
+function mount_snapshot() {
+    if ( mount "/dev/$VG/$SNAPSHOT_NAME" "$TMP_DIR" -o ro -t "$FS" ); then
+        return 0
+    else
+        echo "Failed to mount snapshot." >&2
+        return 1
+    fi
+}
+
+function umount_snapshot() {
+    if ( umount -f "$TMP_DIR" ); then
+        return 0
+    else
+        echo "Failed to umount snapshot." >&2
+        return 1
+    fi
+}
+
+
+if [ "$1" == "--progress" ]; then
+    BORG_OPTS="$BORG_OPTS --progress --stats"
+    [ "${PRUNE_OPTS}" ] && PRUNE_OPTS="$PRUNE_OPTS --stats"
+    shift
+fi
+
+echo "lvm2borg - LVM backup made easy" >&2
+[ "$#" -eq 0 ] && help
+
+NECESSARY_EXECUTABLES="echo date mktemp lvs lvcreate lvremove mount umount"
+if ! which $NECESSARY_EXECUTABLES >/dev/null 2>&1; then
+    echo "Missing binaries!" >&2
+    echo "Make sure these tools are available: $NECESSARY_EXECUTABLES" >&2
+    exit 255
+fi
+
+discover_names "$1"
+
+if [ -z "$VG" ]; then
+    echo "Unable to find volume group." >&2
+    exit 1
+fi
+if [ -z "$LV" ]; then
+    echo "Unable to find logical volume." >&2
+    exit 1
+fi
+
+[ -z "$SNAPSHOT_NAME" ] && SNAPSHOT_NAME=`date +%y%m%d%H%M%S`
+[ -z "$SNAPSHOT_SIZE" ] && SNAPSHOT_SIZE=10%ORIGIN
+[ -z "$ARCHIVE_NAME" ] && ARCHIVE_NAME="`hostname`-$LV"
+[ -z "$BORG_BIN" ] && BORG_BIN="borg"
+
+
+FS="$2"
+[ -z "$FS" ] && FS=auto
+
+if  ! create_tmpdir; then
+    echo "[tmpdir FAILED]" >&2
+    exit 1
+fi
+if ! create_snapshot; then
+    echo "[snapshot FAILED]" >&2
+    exit 1
+fi
+if ! mount_snapshot; then
+    umount_snapshot
+    destroy_snapshot
+    echo "[mount FAILED]" >&2
+    exit 1
+fi
+
+echo "[calling borg]" >&2
+
+cd $TMP_DIR
+if ( $BORG_BIN create --one-file-system $BORG_OPTS "::$ARCHIVE_NAME-$SNAPSHOT_NAME" . ); then
+    [ -z "$PRUNE_OPTS" ] && echo "[borg done]" >&2
+    FAILED=0
+else
+    echo "[borg create FAILED]" >&2
+    FAILED=1
+fi
+cd ..
+
+sleep 1
+umount_snapshot
+destroy_snapshot
+rm -d "$TMP_DIR"
+
+if [ "$FAILED" -eq "0" -a -n "${PRUNE_OPTS}" ]; then
+    $BORG_BIN prune --glob-archives "$ARCHIVE_NAME-"'*' $PRUNE_OPTS && echo "[borg done]" >&2 || echo "[borg create done; prune FAILED]" >&2
+    # for old borg version use:
+    # $BORG_BIN prune --prefix "${ARCHIVE_NAME}-"  $PRUNE_OPTS && echo "[borg done]" >&2 || echo "[borg create done; prune FAILED]" >&2
+fi
+
+exit $FAILED

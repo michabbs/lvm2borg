@@ -37,10 +37,10 @@
 #export BORG_PASSPHRASE=
 
 # You might want to add extra options to borg (see borg documentation)
-BORG_OPTS="--compression=auto,zstd"
+#BORG_OPTS="--compression=auto,zstd"
 
 # You might want to run borg prune after successfull beckup. (Disabled if undefined.)
-PRUNE_OPTS="--keep-last=2 --keep-hourly=24 --keep-daily=14 --keep-weekly=8 --keep-monthly=15 --keep-yearly=10"
+#PRUNE_OPTS="--keep-last=2 --keep-hourly=24 --keep-daily=14 --keep-weekly=8 --keep-monthly=15 --keep-yearly=10"
 
 # Maually set an archive name.
 #ARCHIVE_NAME="hostname-lv"
